@@ -43,20 +43,34 @@ export function loadSavedPlayer(): SavedPlayer | null {
 const IDS_KEY = 'expres-ak-ids'
 const ID_TTL = 4 * 3600_000
 
-function readIds(): Record<string, { playerId: string; name: string; ts: number }> {
+interface IdEntry {
+  playerId: string
+  names: string[]
+  ts: number
+}
+
+function readIds(): Record<string, IdEntry> {
   try {
-    const all = JSON.parse(localStorage.getItem(IDS_KEY) || '{}') as Record<string, { playerId: string; name: string; ts: number }>
-    for (const k of Object.keys(all)) if (Date.now() - all[k].ts > ID_TTL) delete all[k]
+    const all = JSON.parse(localStorage.getItem(IDS_KEY) || '{}') as Record<string, IdEntry & { name?: string }>
+    for (const k of Object.keys(all)) {
+      const e = all[k]
+      if (!e.names) e.names = e.name ? [e.name] : []
+      if (Date.now() - e.ts > ID_TTL) delete all[k]
+    }
     return all
   } catch {
     return {}
   }
 }
 
-function rememberIdentity(pin: string, playerId: string, name: string) {
+const norm = (n: string) => n.trim().toLowerCase()
+
+/** Zapamatuje si identitu pod jménem, které hráč zadal, i pod tím, které mu přidělil hostitel („Anna 2“). */
+function rememberIdentity(pin: string, playerId: string, names: string[]) {
   try {
     const all = readIds()
-    all[pin] = { playerId, name, ts: Date.now() }
+    const prev = all[pin]?.playerId === playerId ? all[pin].names : []
+    all[pin] = { playerId, names: [...new Set([...prev, ...names.map(norm)])], ts: Date.now() }
     localStorage.setItem(IDS_KEY, JSON.stringify(all))
   } catch {
     /* nic */
@@ -65,7 +79,7 @@ function rememberIdentity(pin: string, playerId: string, name: string) {
 
 function findIdentity(pin: string, name: string): string | undefined {
   const e = readIds()[pin]
-  return e && e.name.trim().toLowerCase() === name.trim().toLowerCase() ? e.playerId : undefined
+  return e && e.names.includes(norm(name)) ? e.playerId : undefined
 }
 
 export function clearSavedPlayer() {
@@ -104,6 +118,8 @@ export class PlayerClient {
   private lastAnswer: { endsAt: number; msg: ClientMsg; confirmed: boolean; sentAt: number } | null = null
   private resendTimer = 0
   private wasJoined: boolean
+  /** Jméno, které hráč zadal (hostitel ho může přejmenovat, např. na „Anna 2“). */
+  private typedName: string
 
   constructor(
     private pin: string,
@@ -113,6 +129,7 @@ export class PlayerClient {
     link?: LinkKind,
     wasJoined = false,
   ) {
+    this.typedName = name
     this.playerId = playerId ?? findIdentity(pin, name) ?? randomId()
     this.kind = link
     this.wasJoined = wasJoined
@@ -262,7 +279,7 @@ export class PlayerClient {
         window.clearTimeout(this.joinTimer)
         this.update({ status: 'joined', error: undefined, name: msg.name })
         this.save()
-        rememberIdentity(this.pin, this.playerId, this.snapshot.name)
+        rememberIdentity(this.pin, this.playerId, [this.typedName, msg.name])
         break
       case 'rejected':
         this.fail(msg.reason)

@@ -285,7 +285,7 @@ function Joined({ client, onLeave }: { client: PlayerClient; onLeave: (err?: str
           Spojení se přerušilo, připojuji znovu…
         </div>
       )}
-      {s.status === 'host-away' && (
+      {s.status === 'host-away' && v.phase !== 'final' && (
         <div className="banner banner-error" role="status">
           Počítač se hrou neodpovídá. Je hra na projektoru pořád otevřená?{' '}
           <button className="link" onClick={() => onLeave()}>
