@@ -21,6 +21,7 @@ Hostitel pustí hru na projektoru, spolužáci se připojí z mobilů přes PIN 
 3. Vyber délku hry (celá jízda 12 otázek, nebo rychlík 3 otázky) a klikni **Vyjíždíme!**
 
 Když se stránka hostitele omylem obnoví, nabídne **Obnovit rozehranou hru** a hráči se připojí sami.
+Tlačítkem **Zamknout vstup** v lobby zabráníš tomu, aby se do hry připojoval někdo další (třeba falešní hráči).
 
 ## Nasazení na Vercel
 
@@ -35,7 +36,11 @@ Když se stránka hostitele omylem obnoví, nabídne **Obnovit rozehranou hru** 
 
 **Proč databáze?** Bez ní se telefony spojují s počítačem napřímo (WebRTC). To na školní Wi-Fi a mobilních datech
 často nefunguje a telefon pak zůstane viset na „Připojuji se ke hře…“. S databází jde všechno přes server webu
-jako obyčejné HTTPS, takže hra funguje všude, kde jde otevřít web. Bezplatný tarif Upstash na hry ve třídě bohatě stačí.
+jako obyčejné HTTPS, takže hra funguje všude, kde jde otevřít web.
+
+**Kolik to stojí?** Nic. Bezplatný tarif Upstash má 500 000 příkazů měsíčně. Hra celé třídy (asi 30 mobilů,
+10–15 minut) jich spotřebuje zhruba 20–40 tisíc, takže měsíčně vystačí asi na 15–20 her včetně zkoušek. Když se
+limit vyčerpá, web to pozná a sám přepne na přímé spojení. Na `/test` pak uvidíš upozornění.
 
 **Vercel hlásí přihlášení?** Používej hlavní adresu (`nazev-projektu.vercel.app`), ne dlouhou adresu konkrétního nasazení
 (`nazev-abc123-tvuj-ucet.vercel.app`). Ty chrání Vercel přihlášením, takže by se na ně spolužáci nedostali. QR kód v lobby

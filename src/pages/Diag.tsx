@@ -52,10 +52,14 @@ export function DiagPage() {
         const [health, ms] = await timed(async () => {
           const r = await fetch('/api/relay', { cache: 'no-store' })
           if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return (await r.json()) as { relay?: boolean }
+          return (await r.json()) as { relay?: boolean; reason?: string }
         })
         if (!health.relay) {
-          upd('relay', 'warn', 'Server běží, ale nemá připojenou databázi. Hra použije přímé spojení. Návod na zapnutí je v README.')
+          if (health.reason === 'store-error') {
+            upd('relay', 'bad', 'Databáze je připojená, ale neodpovídá (vyčerpaný měsíční limit, nebo smazaná databáze). Hra zatím použije přímé spojení.')
+          } else {
+            upd('relay', 'warn', 'Server běží, ale nemá připojenou databázi. Hra použije přímé spojení. Návod na zapnutí je v README.')
+          }
           return
         }
         const [room, ms2] = await timed(() => post({ op: 'create' }))

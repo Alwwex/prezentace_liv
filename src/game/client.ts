@@ -1,4 +1,4 @@
-import { P2PPlayerLink, RelayPlayerLink, relayAvailable, relayRoomExists, type LinkKind, type PlayerLink } from './link'
+import { P2PPlayerLink, RelayPlayerLink, relayRoomExists, waitRelayStatus, type LinkKind, type PlayerLink } from './link'
 import { randomId } from './net'
 import type { Answer, ClientMsg, HostMsg, PlayerView } from './types'
 
@@ -78,12 +78,12 @@ export function clearSavedPlayer() {
 
 /** Jak často se ptát serveru na novou obrazovku podle fáze hry (ms). */
 const PACE: Record<PlayerView['phase'], number> = {
-  lobby: 1200,
-  intro: 600,
-  question: 900,
-  result: 1000,
-  leaderboard: 1100,
-  final: 4000,
+  lobby: 1500,
+  intro: 700,
+  question: 1000,
+  result: 1200,
+  leaderboard: 1500,
+  final: 5000,
 }
 
 export class PlayerClient {
@@ -94,10 +94,15 @@ export class PlayerClient {
   private joined = false
   private destroyed = false
   private pingTimer = 0
+  private helloTimer = 0
   private joinTimer = 0
   private playerId: string
-  /** Na kterou otázku už hráč odpověděl (aby starší obrazovka ze serveru nepřepsala „odesláno“). */
-  private answeredQ = -1
+  /**
+   * Odpověď na právě běžící otázku (endsAt jednoznačně určuje konkrétní spuštění otázky).
+   * Dokud hostitel nepotvrdí příjem, posíláme ji znovu – kdyby se po cestě ztratila.
+   */
+  private lastAnswer: { endsAt: number; msg: ClientMsg; confirmed: boolean; sentAt: number } | null = null
+  private resendTimer = 0
   private wasJoined: boolean
 
   constructor(
@@ -134,17 +139,31 @@ export class PlayerClient {
 
   destroy() {
     this.destroyed = true
+    window.clearInterval(this.resendTimer)
+    window.clearInterval(this.helloTimer)
     window.clearInterval(this.pingTimer)
     window.clearTimeout(this.joinTimer)
     this.link?.destroy()
   }
 
   answer(qIndex: number, answer: Answer, joker: boolean) {
-    const ms = this.snapshot.shownAt ? Math.max(0, Date.now() - this.snapshot.shownAt) : undefined
-    this.answeredQ = qIndex
-    this.link?.send({ t: 'answer', qIndex, answer, joker, ms })
     const v = this.snapshot.view
-    if (v && v.phase === 'question' && v.qIndex === qIndex) this.update({ view: { ...v, answered: true } })
+    if (!v || v.phase !== 'question' || v.qIndex !== qIndex) return
+    const ms = this.snapshot.shownAt ? Math.max(0, Date.now() - this.snapshot.shownAt) : undefined
+    const msg: ClientMsg = { t: 'answer', qIndex, answer, joker, ms }
+    this.lastAnswer = { endsAt: v.endsAt, msg, confirmed: false, sentAt: Date.now() }
+    this.link?.send(msg)
+    this.update({ view: { ...v, answered: true } })
+  }
+
+  /** Znovu pošle nepotvrzenou odpověď, dokud otázka běží. */
+  private resendAnswer() {
+    const a = this.lastAnswer
+    const v = this.snapshot.view
+    if (!a || a.confirmed || !v || v.phase !== 'question' || v.endsAt !== a.endsAt) return
+    if (Date.now() > this.snapshot.deadline + 2000 || Date.now() - a.sentAt < 2000) return
+    a.sentAt = Date.now()
+    this.link?.send(a.msg)
   }
 
   react(emoji: string) {
@@ -171,7 +190,12 @@ export class PlayerClient {
     if (!kind) {
       // Má-li web databázi, hostitel ji používá taky – hra pak musí existovat na serveru.
       // Bez databáze zkusíme přímé spojení přes PeerJS.
-      kind = (await relayAvailable()) ? 'relay' : 'p2p'
+      kind = (await waitRelayStatus(
+        () => undefined,
+        () => this.destroyed,
+      ))
+        ? 'relay'
+        : 'p2p'
       if (kind === 'relay') {
         try {
           if (!(await relayRoomExists(this.pin, this.playerId))) {
@@ -186,12 +210,18 @@ export class PlayerClient {
     if (this.destroyed) return
     this.kind = kind
     this.save()
+    this.resendTimer = window.setInterval(() => this.resendAnswer(), 500)
     if (kind === 'relay') {
       const link = new RelayPlayerLink(this.pin, this.playerId, events)
       this.link = link
       link.send(this.hello())
       // Dokud hostitel hráče nepřijme, připomínáme se (kdyby se první zpráva ztratila).
-      this.pingTimer = window.setInterval(() => link.send(this.joined ? { t: 'ping' } : this.hello()), 8000)
+      this.helloTimer = window.setInterval(() => {
+        if (!this.joined) link.send(this.hello())
+      }, 8000)
+      this.pingTimer = window.setInterval(() => {
+        if (this.joined) link.send({ t: 'ping' })
+      }, 20_000)
     } else {
       this.link = new P2PPlayerLink(this.pin, this.hello, events, (reason) => this.fail(reason), this.wasJoined)
     }
@@ -250,7 +280,11 @@ export class PlayerClient {
           window.clearTimeout(this.joinTimer)
           this.save()
         }
-        if (v.phase === 'question' && v.qIndex === this.answeredQ && !v.answered) v = { ...v, answered: true }
+        if (v.phase === 'question' && this.lastAnswer && v.endsAt === this.lastAnswer.endsAt) {
+          // Hostitel odpověď potvrdil – už ji neposíláme. Jinak dál ukazujeme „odesláno“.
+          if (v.answered) this.lastAnswer.confirmed = true
+          else v = { ...v, answered: true }
+        }
         const prev = this.snapshot.view
         const sameQuestion = prev?.phase === 'question' && v.phase === 'question' && prev.qIndex === v.qIndex
         const patch: Partial<ClientSnapshot> = { view: v, status: 'joined' }

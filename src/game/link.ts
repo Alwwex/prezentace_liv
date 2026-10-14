@@ -45,34 +45,47 @@ async function api<T>(body: object, timeoutMs = 10000): Promise<T> {
   }
 }
 
-let relayCheck: Promise<boolean> | null = null
+export type RelayState = 'yes' | 'no' | 'unknown'
+
+let relayYes = false
 
 /**
- * Má server webu nastavenou databázi? Kladný výsledek si pamatujeme,
- * záporný ne – při dalším pokusu (třeba po výpadku Wi-Fi) se zeptáme znovu.
+ * Je k dispozici spojení přes server? 'no' jen při jednoznačné odpovědi (web nemá databázi,
+ * databáze nefunguje, nebo /api/relay vůbec neexistuje). Při výpadku sítě vrací 'unknown',
+ * aby se hra kvůli chvilkovému zakolísání Wi-Fi nepřepnula na přímé spojení.
  */
-export function relayAvailable(): Promise<boolean> {
-  if (!relayCheck) {
-    relayCheck = (async () => {
-      for (let i = 0; i < 2; i++) {
-        try {
-          const ctrl = new AbortController()
-          const timer = window.setTimeout(() => ctrl.abort(), 6000)
-          const res = await fetch(API, { cache: 'no-store', signal: ctrl.signal })
-          window.clearTimeout(timer)
-          if (res.ok) return !!((await res.json()) as { relay?: boolean }).relay
-          if (res.status === 404) return false
-        } catch {
-          /* další pokus */
-        }
-      }
-      return false
-    })()
-    void relayCheck.then((ok) => {
-      if (!ok) relayCheck = null
-    })
+export async function relayStatus(): Promise<RelayState> {
+  if (relayYes) return 'yes'
+  try {
+    const ctrl = new AbortController()
+    const timer = window.setTimeout(() => ctrl.abort(), 6000)
+    const res = await fetch(API, { cache: 'no-store', signal: ctrl.signal })
+    window.clearTimeout(timer)
+    if (res.status === 404 || res.status === 405) return 'no'
+    if (!res.ok) return 'unknown'
+    let data: { relay?: boolean }
+    try {
+      data = (await res.json()) as { relay?: boolean }
+    } catch {
+      return 'no' // místo API přišla HTML stránka (statický hosting bez funkcí)
+    }
+    if (data.relay) relayYes = true
+    return data.relay ? 'yes' : 'no'
+  } catch {
+    return 'unknown'
   }
-  return relayCheck
+}
+
+/** Opakuje relayStatus(), dokud nepřijde jednoznačná odpověď. */
+export async function waitRelayStatus(onWaiting: () => void, isCancelled: () => boolean): Promise<boolean> {
+  for (let i = 0; ; i++) {
+    const st = await relayStatus()
+    if (st !== 'unknown') return st === 'yes'
+    if (isCancelled()) return false
+    onWaiting()
+    await wait(Math.min(8000, 1500 * (i + 1)))
+    if (isCancelled()) return false
+  }
 }
 
 // ============================================================
@@ -112,6 +125,7 @@ interface Slot {
 
 const SYNC_MS = 400
 /** Když se nic neděje, ptáme se serveru méně často (šetří limit databáze). */
+const SYNC_CALM_MS = 800
 const SYNC_IDLE_MS = 1500
 const SYNC_SLEEP_MS = 5000
 const TOUCH_MS = 60_000
@@ -132,10 +146,14 @@ export class RelayHostLink implements HostLink {
   private lastTouch = 0
   private failures = 0
 
+  /** Uložené spojení z minula – vracíme ho, dokud se místnost znovu nezaloží. */
+  private initial: SavedLink | undefined
+
   constructor(
     private ev: HostLinkEvents,
     saved?: SavedLink,
   ) {
+    this.initial = saved
     void this.open(saved)
   }
 
@@ -144,6 +162,7 @@ export class RelayHostLink implements HostLink {
   }
 
   saved(): SavedLink {
+    if (!this.pin && this.initial) return this.initial
     return { kind: 'relay', pin: this.pin, secret: this.secret }
   }
 
@@ -195,6 +214,7 @@ export class RelayHostLink implements HostLink {
         this.clock(t0, r.now)
         this.pin = r.pin
         this.secret = r.secret
+        this.initial = { kind: 'relay', pin: r.pin, secret: r.secret }
         this.ev.pin(r.pin)
         this.ev.status('ready')
         this.lastTouch = Date.now()
@@ -262,6 +282,7 @@ export class RelayHostLink implements HostLink {
       if (e instanceof RelayError && e.status === 403) {
         // Místnost vypršela nebo ji smazal server – založíme ji znovu se stejným PINem.
         const again: SavedLink = { kind: 'relay', pin: this.pin, secret: this.secret }
+        this.initial = again
         this.inFlight = false
         this.pin = ''
         void this.open(again)
@@ -272,7 +293,8 @@ export class RelayHostLink implements HostLink {
       this.inFlight = false
     }
     const idle = Date.now() - this.lastActivity
-    const calm = idle > 10 * 60_000 ? SYNC_SLEEP_MS : idle > 60_000 ? SYNC_IDLE_MS : SYNC_MS
+    const calm =
+      idle > 10 * 60_000 ? SYNC_SLEEP_MS : idle > 60_000 ? SYNC_IDLE_MS : idle > 10_000 ? SYNC_CALM_MS : SYNC_MS
     const next = this.again || this.dirty.size ? 30 : this.failures ? Math.min(5000, 600 * this.failures) : calm
     this.again = false
     this.schedule(next)
@@ -621,7 +643,7 @@ export class P2PPlayerLink implements PlayerLink {
         /* spojení se právě zavřelo */
       }
     }
-    if (msg.t === 'answer') this.pending.push(msg)
+    if (msg.t === 'answer') this.pending = [msg]
   }
 
   pace() {

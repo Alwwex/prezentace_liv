@@ -1,5 +1,5 @@
 import { QUESTION_SETS } from '../data/questions'
-import { P2PHostLink, RelayHostLink, relayAvailable, type HostLink, type LinkKind, type SavedLink } from './link'
+import { P2PHostLink, RelayHostLink, waitRelayStatus, type HostLink, type LinkKind, type SavedLink } from './link'
 import { AVATARS, REACTIONS, cleanName, randomPin } from './net'
 import { later } from './ticker'
 import {
@@ -72,6 +72,7 @@ export interface HostSnapshot {
   connectedCount: number
   reactions: Reaction[]
   stats: QuestionStat[]
+  locked: boolean
 }
 
 interface SavedGame {
@@ -84,13 +85,15 @@ interface SavedGame {
   players: HostPlayer[]
   stats: QuestionStat[]
   banned: string[]
+  locked?: boolean
   savedAt: number
 }
 
 const SAVE_KEY = 'expres-ak-host'
 export const INTRO_MS = 4500
 const MAX_PLAYERS = 80
-const PING_TIMEOUT = 20000
+/** Za jak dlouho bez zprávy považujeme hráče za odpojeného (relay posílá ping méně často). */
+const PING_TIMEOUT = { relay: 50_000, p2p: 20_000 }
 
 export function loadSavedGame(): SavedGame | null {
   try {
@@ -130,6 +133,7 @@ export class HostGame {
   private timers: (() => void)[] = []
   private watchdog: number
   private reactionKey = 0
+  private locked = false
 
   private status: HostSnapshot['status'] = 'connecting'
   private error: string | undefined
@@ -214,6 +218,12 @@ export class HostGame {
     this.setPhase('lobby')
   }
 
+  /** Zamčené lobby nepustí nové hráče (známí se můžou dál připojovat). */
+  setLocked(locked: boolean) {
+    this.locked = locked
+    this.emit()
+  }
+
   kick(id: string) {
     this.link?.send(id, { t: 'kicked' })
     this.link?.drop(id)
@@ -249,8 +259,14 @@ export class HostGame {
       },
     }
     // Pokud má web databázi, jde spojení přes server (spolehlivé na každé síti),
-    // jinak přímo mezi zařízeními přes WebRTC.
-    const relay = await relayAvailable()
+    // jinak přímo mezi zařízeními přes WebRTC. Rozehraná hra přes server zůstane
+    // na serveru i při výpadku Wi-Fi (jinak by se změnil PIN a třída by se odpojila).
+    const relay =
+      saved?.kind === 'relay' ||
+      (await waitRelayStatus(
+        () => events.status('connecting', 'Ověřuji spojení se serverem hry…'),
+        () => this.destroyed,
+      ))
     if (this.destroyed) return
     if (relay) {
       this.link = new RelayHostLink(events, saved?.kind === 'relay' ? saved : undefined)
@@ -307,7 +323,9 @@ export class HostGame {
     this.startedAt = Date.now()
     this.startedAtLink = this.linkNow()
     this.setPhase('question')
-    this.later(() => this.endQuestion(), q.time * 1000 + 300)
+    // Přes server dorazí odpovědi z poslední vteřiny o kousek později – počkáme na ně.
+    const grace = this.link?.kind === 'relay' ? 1500 : 300
+    this.later(() => this.endQuestion(), q.time * 1000 + grace)
   }
 
   private endQuestion() {
@@ -371,7 +389,7 @@ export class HostGame {
     const now = Date.now()
     let changed = false
     for (const p of this.players) {
-      if (p.connected && now - (this.lastSeen.get(p.id) ?? 0) > PING_TIMEOUT) {
+      if (p.connected && now - (this.lastSeen.get(p.id) ?? 0) > PING_TIMEOUT[this.link?.kind ?? 'p2p']) {
         p.connected = false
         this.link?.drop(p.id)
         changed = true
@@ -384,11 +402,8 @@ export class HostGame {
     if (!msg || typeof msg !== 'object') return
     if (msg.t === 'hello') return this.onHello(id, msg)
     const p = this.players.find((x) => x.id === id)
-    if (!p) {
-      // Hráč, kterého hostitel nezná (např. po vyhození), dostane odmítnutí.
-      if (this.banned.has(id)) this.send(id, { t: 'rejected', reason: 'Hostitel tě z této hry odebral.' })
-      return
-    }
+    // Zprávy od neznámých hráčů (např. ping vyhozeného) ignorujeme – vyhozený už dostal „kicked“.
+    if (!p) return
     this.lastSeen.set(id, Date.now())
     if (!p.connected) {
       p.connected = true
@@ -409,6 +424,10 @@ export class HostGame {
     }
     let p = this.players.find((x) => x.id === id)
     if (!p) {
+      if (this.locked) {
+        this.send(id, { t: 'rejected', reason: 'Vstup do hry je zamčený. Požádej hostitele, ať ho odemkne.' })
+        return
+      }
       if (this.players.length >= MAX_PLAYERS) {
         this.send(id, { t: 'rejected', reason: 'Hra je plná.' })
         return
@@ -455,7 +474,9 @@ export class HostGame {
     // Telefon posílá, za jak dlouho po zobrazení otázky hráč odpověděl. Díky tomu
     // nikoho neznevýhodní pomalejší síť; víc, než kolik uplynulo na serveru, to být nemůže.
     const reported = typeof msg.ms === 'number' && msg.ms >= 0 ? msg.ms : sinceStart
-    const elapsed = Math.min(sinceStart, reported)
+    // Zpoždění sítě odečteme nejvýš o pár vteřin – víc by šlo zneužít podvrženou hodnotou.
+    const slack = this.link?.kind === 'relay' ? 2500 : 1000
+    const elapsed = Math.max(sinceStart - slack, Math.min(sinceStart, reported))
     const useJoker = !!msg.joker && !p.jokerUsed
     if (useJoker) p.jokerUsed = true
     p.answer = { value: msg.answer, elapsed, joker: useJoker }
@@ -577,6 +598,7 @@ export class HostGame {
       connectedCount: this.players.filter((p) => p.connected).length,
       reactions: this.reactions,
       stats: this.stats,
+      locked: this.locked,
     }
   }
 
@@ -591,6 +613,7 @@ export class HostGame {
       players: this.players.map((p) => ({ ...p, answer: undefined, connected: false })),
       stats: this.stats,
       banned: [...this.banned],
+      locked: this.locked,
       savedAt: Date.now(),
     }
     try {
@@ -608,6 +631,7 @@ export class HostGame {
     this.players = s.players.map((p) => ({ ...p, connected: false, answer: undefined }))
     this.stats = s.stats ?? []
     this.banned = new Set(s.banned ?? [])
+    this.locked = !!s.locked
     this.qIndex = Math.min(s.qIndex, this.questions.length - 1)
     let phase = s.phase
     // Rozehranou otázku nejde obnovit – vrátíme se na průběžné pořadí a otázku spustíme znovu.

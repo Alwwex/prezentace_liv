@@ -15,6 +15,8 @@ const TTL = 6 * 3600
 const INBOX_TTL = 3600
 const HOST_FIELD = '__host'
 const MAX_BODY = 256 * 1024
+/** Největší povolená zpráva od hráče (přihlášení, odpověď, reakce). */
+const MAX_MSG = 2048
 
 type Cmd = (string | number)[]
 
@@ -112,6 +114,8 @@ function memoryStore(): Store {
       }
       case 'DEL':
         return [key, ...a].filter((k) => m.delete(k)).length
+      case 'PING':
+        return 'PONG'
       default:
         throw new Error(`Nepodporovaný příkaz ${op}`)
     }
@@ -240,9 +244,9 @@ async function handle(store: Store, b: Body): Promise<Response> {
       for (const [id, slot] of Object.entries(slots)) if (isId(id) && typeof slot === 'string') pairs.push(id, slot)
       cmds.push(['HSET', k(b.pin, 'views'), ...pairs])
       if (Array.isArray(b.remove) && b.remove.length) cmds.push(['HDEL', k(b.pin, 'views'), ...b.remove.filter(isId)])
-      cmds.push(['LPOP', k(b.pin, 'inbox'), 200])
+      cmds.push(['LPOP', k(b.pin, 'inbox'), 100])
       // Prodloužení platnosti stačí jednou za čas, šetří to příkazy databáze.
-      if (b.touch) cmds.push(['EXPIRE', k(b.pin, 'views'), TTL], ['EXPIRE', k(b.pin, 'meta'), TTL])
+      if (b.touch) cmds.push(['EXPIRE', k(b.pin, 'views'), TTL], ['EXPIRE', k(b.pin, 'meta'), TTL], ['EXPIRE', k(b.pin, 'inbox'), INBOX_TTL])
       const out = await store.run(cmds)
       const popped = out[cmds.findIndex((c) => c[0] === 'LPOP')]
       const inbox = Array.isArray(popped) ? popped : popped ? [popped] : []
@@ -255,12 +259,15 @@ async function handle(store: Store, b: Body): Promise<Response> {
       const msg = b.msg
       if (!msg || typeof msg !== 'object') return json({ error: 'bad-request' }, 400)
       const entry = JSON.stringify({ from: b.playerId, at: now, msg })
-      const [vals] = (await store.run([
-        ['HMGET', k(b.pin, 'views'), HOST_FIELD],
+      // Skutečné zprávy hry mají pár set bajtů; větší jsou pokus o zahlcení.
+      if (entry.length > MAX_MSG) return json({ error: 'too-large' }, 413)
+      // Nejdřív ověříme, že hra existuje – do neexistujících her nic neukládáme.
+      const [vals] = (await store.run([['HMGET', k(b.pin, 'views'), HOST_FIELD]])) as (string | null)[][]
+      if (vals[0] == null) return json({ error: 'no-room' }, 404)
+      await store.run([
         ['RPUSH', k(b.pin, 'inbox'), entry],
         ['EXPIRE', k(b.pin, 'inbox'), INBOX_TTL],
-      ])) as (string | null)[][]
-      if (vals[0] == null) return json({ error: 'no-room' }, 404)
+      ])
       return json({ now })
     }
 
@@ -277,8 +284,27 @@ async function handle(store: Store, b: Body): Promise<Response> {
   }
 }
 
+// Stav databáze si instance pamatuje 30 s, ať každý dotaz nestojí příkaz navíc.
+let health: { ok: boolean; at: number } | null = null
+
+/**
+ * Je spojení přes server k dispozici? Ověří i to, že databáze opravdu odpovídá
+ * (např. po vyčerpání měsíčního limitu ne) – pak web použije přímé spojení.
+ */
 export async function GET(): Promise<Response> {
-  return json({ relay: getStore() !== null, now: Date.now() })
+  const store = getStore()
+  if (!store) return json({ relay: false, reason: 'no-store', now: Date.now() })
+  if (!health || Date.now() - health.at > 30_000) {
+    const ok = await store.run([['PING']]).then(
+      () => true,
+      (e) => {
+        console.error('relay store unavailable', e)
+        return false
+      },
+    )
+    health = { ok, at: Date.now() }
+  }
+  return json({ relay: health.ok, reason: health.ok ? undefined : 'store-error', now: Date.now() })
 }
 
 export async function POST(request: Request): Promise<Response> {

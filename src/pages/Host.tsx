@@ -277,9 +277,18 @@ function Lobby({ s, game }: { s: HostSnapshot; game: HostGame }) {
             </div>
           )}
         </div>
-        <button className="btn btn-gold btn-xl" disabled={s.players.length === 0} onClick={() => game.start()}>
-          Vyjíždíme! ▶
-        </button>
+        <div className="lobby-actions">
+          <button
+            className={`btn btn-ghost ${s.locked ? 'is-locked' : ''}`}
+            onClick={() => game.setLocked(!s.locked)}
+            title="Zamčená hra nepustí nové hráče (třeba když někdo posílá falešné hráče)."
+          >
+            {s.locked ? '🔒 Vstup zamčený' : '🔓 Zamknout vstup'}
+          </button>
+          <button className="btn btn-gold btn-xl" disabled={s.players.length === 0} onClick={() => game.start()}>
+            Vyjíždíme! ▶
+          </button>
+        </div>
       </footer>
     </section>
   )
