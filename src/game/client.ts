@@ -190,7 +190,8 @@ export class PlayerClient {
       const link = new RelayPlayerLink(this.pin, this.playerId, events)
       this.link = link
       link.send(this.hello())
-      this.pingTimer = window.setInterval(() => this.joined && link.send({ t: 'ping' }), 8000)
+      // Dokud hostitel hráče nepřijme, připomínáme se (kdyby se první zpráva ztratila).
+      this.pingTimer = window.setInterval(() => link.send(this.joined ? { t: 'ping' } : this.hello()), 8000)
     } else {
       this.link = new P2PPlayerLink(this.pin, this.hello, events, (reason) => this.fail(reason), this.wasJoined)
     }
