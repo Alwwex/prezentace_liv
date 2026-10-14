@@ -1,8 +1,8 @@
-import Peer, { type DataConnection } from 'peerjs'
-import { hostPeerId, peerOptions, randomId } from './net'
+import { P2PPlayerLink, RelayPlayerLink, relayAvailable, relayRoomExists, type LinkKind, type PlayerLink } from './link'
+import { randomId } from './net'
 import type { Answer, ClientMsg, HostMsg, PlayerView } from './types'
 
-export type ClientStatus = 'connecting' | 'joined' | 'reconnecting' | 'error' | 'kicked'
+export type ClientStatus = 'connecting' | 'joined' | 'reconnecting' | 'host-away' | 'error' | 'kicked'
 
 export interface ClientSnapshot {
   status: ClientStatus
@@ -11,6 +11,8 @@ export interface ClientSnapshot {
   view: PlayerView | null
   /** Místní čas, kdy vyprší aktuální otázka. */
   deadline: number
+  /** Místní čas, kdy se otázka na telefonu objevila. */
+  shownAt: number
 }
 
 interface SavedPlayer {
@@ -18,9 +20,14 @@ interface SavedPlayer {
   playerId: string
   name: string
   avatar: string
+  link?: LinkKind
+  /** Hráč už byl ve hře přijatý (po obnovení stránky se nemá znovu ptát na PIN). */
+  joined?: boolean
 }
 
 const SAVE_KEY = 'expres-ak-player'
+/** Jak dlouho čekat na první připojení, než ukážeme chybu. */
+const JOIN_TIMEOUT = 25_000
 
 export function loadSavedPlayer(): SavedPlayer | null {
   try {
@@ -31,6 +38,36 @@ export function loadSavedPlayer(): SavedPlayer | null {
   }
 }
 
+// Identita hráče pro daný PIN, aby po znovuotevření odkazu (nová karta, znovu naskenovaný QR)
+// a zadání stejného jména pokračoval jako tentýž hráč a nepřišel o body.
+const IDS_KEY = 'expres-ak-ids'
+const ID_TTL = 4 * 3600_000
+
+function readIds(): Record<string, { playerId: string; name: string; ts: number }> {
+  try {
+    const all = JSON.parse(localStorage.getItem(IDS_KEY) || '{}') as Record<string, { playerId: string; name: string; ts: number }>
+    for (const k of Object.keys(all)) if (Date.now() - all[k].ts > ID_TTL) delete all[k]
+    return all
+  } catch {
+    return {}
+  }
+}
+
+function rememberIdentity(pin: string, playerId: string, name: string) {
+  try {
+    const all = readIds()
+    all[pin] = { playerId, name, ts: Date.now() }
+    localStorage.setItem(IDS_KEY, JSON.stringify(all))
+  } catch {
+    /* nic */
+  }
+}
+
+function findIdentity(pin: string, name: string): string | undefined {
+  const e = readIds()[pin]
+  return e && e.name.trim().toLowerCase() === name.trim().toLowerCase() ? e.playerId : undefined
+}
+
 export function clearSavedPlayer() {
   try {
     sessionStorage.removeItem(SAVE_KEY)
@@ -39,29 +76,49 @@ export function clearSavedPlayer() {
   }
 }
 
+/** Jak často se ptát serveru na novou obrazovku podle fáze hry (ms). */
+const PACE: Record<PlayerView['phase'], number> = {
+  lobby: 1200,
+  intro: 600,
+  question: 900,
+  result: 1000,
+  leaderboard: 1100,
+  final: 4000,
+}
+
 export class PlayerClient {
-  private peer: Peer | null = null
-  private conn: DataConnection | null = null
+  private link: PlayerLink | null = null
+  private kind: LinkKind | undefined
   private listeners = new Set<() => void>()
   private snapshot: ClientSnapshot
-  private everJoined = false
+  private joined = false
   private destroyed = false
-  private lastHeard = 0
-  private pingTimer: number
-  private retryTimer = 0
+  private pingTimer = 0
+  private joinTimer = 0
   private playerId: string
+  /** Na kterou otázku už hráč odpověděl (aby starší obrazovka ze serveru nepřepsala „odesláno“). */
+  private answeredQ = -1
+  private wasJoined: boolean
 
   constructor(
     private pin: string,
     name: string,
     private avatar: string,
     playerId?: string,
+    link?: LinkKind,
+    wasJoined = false,
   ) {
-    this.playerId = playerId ?? randomId()
-    this.snapshot = { status: 'connecting', name, view: null, deadline: 0 }
+    this.playerId = playerId ?? findIdentity(pin, name) ?? randomId()
+    this.kind = link
+    this.wasJoined = wasJoined
+    this.snapshot = { status: 'connecting', name, view: null, deadline: 0, shownAt: 0 }
     this.save()
-    this.openPeer()
-    this.pingTimer = window.setInterval(() => this.heartbeat(), 4000)
+    this.joinTimer = window.setTimeout(() => {
+      if (!this.joined && !this.wasJoined && !this.destroyed) {
+        this.fail('Nepodařilo se připojit ke hře. Zkontroluj PIN a jestli je hra na počítači spuštěná, a zkus to znovu.')
+      }
+    }, JOIN_TIMEOUT)
+    void this.open()
   }
 
   subscribe = (fn: () => void) => {
@@ -71,25 +128,78 @@ export class PlayerClient {
 
   getSnapshot = () => this.snapshot
 
+  get gamePin() {
+    return this.pin
+  }
+
   destroy() {
     this.destroyed = true
     window.clearInterval(this.pingTimer)
-    window.clearTimeout(this.retryTimer)
-    this.conn?.close()
-    this.peer?.destroy()
+    window.clearTimeout(this.joinTimer)
+    this.link?.destroy()
   }
 
   answer(qIndex: number, answer: Answer, joker: boolean) {
-    this.send({ t: 'answer', qIndex, answer, joker })
-    // Okamžitá odezva, než přijde potvrzení od hostitele.
+    const ms = this.snapshot.shownAt ? Math.max(0, Date.now() - this.snapshot.shownAt) : undefined
+    this.answeredQ = qIndex
+    this.link?.send({ t: 'answer', qIndex, answer, joker, ms })
     const v = this.snapshot.view
-    if (v && v.phase === 'question' && v.qIndex === qIndex) {
-      this.update({ view: { ...v, answered: true } })
-    }
+    if (v && v.phase === 'question' && v.qIndex === qIndex) this.update({ view: { ...v, answered: true } })
   }
 
   react(emoji: string) {
-    this.send({ t: 'react', emoji })
+    this.link?.send({ t: 'react', emoji })
+  }
+
+  // ---------- připojení ----------
+
+  private hello = (): ClientMsg => ({ t: 'hello', playerId: this.playerId, name: this.snapshot.name, avatar: this.avatar })
+
+  private async open() {
+    const events = {
+      status: (s: 'connecting' | 'connected' | 'reconnecting' | 'host-away') => {
+        if (!this.joined && !this.wasJoined) return
+        this.update({ status: s === 'connected' ? 'joined' : s === 'connecting' ? 'reconnecting' : s })
+      },
+      message: (msg: HostMsg, hostNow: number) => this.onMsg(msg, hostNow),
+      missing: () => {
+        if (this.joined || this.wasJoined) this.fail('Hra už skončila nebo ji hostitel zavřel.')
+        else this.fail('Hra s tímto PINem neexistuje. Zkontroluj číslo na plátně.')
+      },
+    }
+    let kind = this.kind
+    if (!kind) {
+      // Má-li web databázi, hostitel ji používá taky – hra pak musí existovat na serveru.
+      // Bez databáze zkusíme přímé spojení přes PeerJS.
+      kind = (await relayAvailable()) ? 'relay' : 'p2p'
+      if (kind === 'relay') {
+        try {
+          if (!(await relayRoomExists(this.pin, this.playerId))) {
+            if (!this.destroyed) events.missing()
+            return
+          }
+        } catch {
+          // Server teď neodpovídá – relay to bude zkoušet dál sám.
+        }
+      }
+    }
+    if (this.destroyed) return
+    this.kind = kind
+    this.save()
+    if (kind === 'relay') {
+      const link = new RelayPlayerLink(this.pin, this.playerId, events)
+      this.link = link
+      link.send(this.hello())
+      this.pingTimer = window.setInterval(() => this.joined && link.send({ t: 'ping' }), 8000)
+    } else {
+      this.link = new P2PPlayerLink(this.pin, this.hello, events, (reason) => this.fail(reason), this.wasJoined)
+    }
+  }
+
+  private fail(error: string) {
+    this.update({ status: 'error', error })
+    clearSavedPlayer()
+    this.destroy()
   }
 
   private update(patch: Partial<ClientSnapshot>) {
@@ -99,113 +209,32 @@ export class PlayerClient {
 
   private save() {
     try {
-      const s: SavedPlayer = { pin: this.pin, playerId: this.playerId, name: this.snapshot.name, avatar: this.avatar }
+      const s: SavedPlayer = {
+        pin: this.pin,
+        playerId: this.playerId,
+        name: this.snapshot.name,
+        avatar: this.avatar,
+        link: this.kind,
+        joined: this.joined || this.wasJoined,
+      }
       sessionStorage.setItem(SAVE_KEY, JSON.stringify(s))
     } catch {
       /* nic */
     }
   }
 
-  private openPeer() {
-    if (this.destroyed) return
-    const peer = new Peer(peerOptions())
-    this.peer = peer
-    peer.on('open', () => this.connect())
-    peer.on('disconnected', () => {
-      if (!peer.destroyed) window.setTimeout(() => !peer.destroyed && peer.disconnected && peer.reconnect(), 1500)
-    })
-    peer.on('error', (err) => {
-      if (this.destroyed) return
-      const type = (err as { type?: string }).type
-      if (type === 'peer-unavailable') {
-        if (!this.everJoined) {
-          this.update({ status: 'error', error: 'Hra s tímto PINem neexistuje. Zkontroluj číslo na plátně.' })
-          this.destroy()
-        } else {
-          this.scheduleRetry()
-        }
-        return
-      }
-      if (type === 'browser-incompatible') {
-        this.update({ status: 'error', error: 'Tento prohlížeč nepodporuje WebRTC. Zkus jiný prohlížeč.' })
-        this.destroy()
-        return
-      }
-      if (!this.everJoined) this.update({ status: 'connecting', error: 'Spojení se nedaří, zkouším znovu…' })
-      this.scheduleRetry()
-    })
-  }
-
-  private connect() {
-    const peer = this.peer
-    if (!peer || peer.destroyed || this.destroyed) return
-    this.conn?.close()
-    const conn = peer.connect(hostPeerId(this.pin), { reliable: true, serialization: 'json' })
-    this.conn = conn
-    conn.on('open', () => {
-      this.lastHeard = Date.now()
-      this.send({ t: 'hello', playerId: this.playerId, name: this.snapshot.name, avatar: this.avatar })
-    })
-    conn.on('data', (raw) => this.onMsg(raw as HostMsg))
-    const lost = () => {
-      if (this.conn !== conn || this.destroyed) return
-      this.conn = null
-      if (this.snapshot.status === 'joined') this.update({ status: 'reconnecting' })
-      this.scheduleRetry()
-    }
-    conn.on('close', lost)
-    conn.on('error', lost)
-  }
-
-  private scheduleRetry() {
-    if (this.destroyed) return
-    window.clearTimeout(this.retryTimer)
-    this.retryTimer = window.setTimeout(() => {
-      const peer = this.peer
-      if (!peer || peer.destroyed) this.openPeer()
-      else if (peer.disconnected) {
-        peer.reconnect()
-        this.scheduleRetry()
-      } else this.connect()
-    }, 2000)
-  }
-
-  private heartbeat() {
-    if (this.destroyed) return
-    if (this.conn?.open) {
-      this.send({ t: 'ping' })
-      if (Date.now() - this.lastHeard > 12000) {
-        // Hostitel neodpovídá – zkusíme se připojit znovu.
-        const c = this.conn
-        this.conn = null
-        c.close()
-        if (this.snapshot.status === 'joined') this.update({ status: 'reconnecting' })
-        this.scheduleRetry()
-      }
-    }
-  }
-
-  private send(msg: ClientMsg) {
-    try {
-      if (this.conn?.open) this.conn.send(msg)
-    } catch {
-      /* nic */
-    }
-  }
-
-  private onMsg(msg: HostMsg) {
-    if (!msg || typeof msg !== 'object') return
-    this.lastHeard = Date.now()
+  private onMsg(msg: HostMsg, hostNow: number) {
+    if (!msg || typeof msg !== 'object' || this.destroyed) return
     switch (msg.t) {
       case 'welcome':
-        this.everJoined = true
+        this.joined = true
+        window.clearTimeout(this.joinTimer)
         this.update({ status: 'joined', error: undefined, name: msg.name })
         this.save()
+        rememberIdentity(this.pin, this.playerId, this.snapshot.name)
         break
       case 'rejected':
-        this.update({ status: 'error', error: msg.reason })
-        clearSavedPlayer()
-        this.destroy()
+        this.fail(msg.reason)
         break
       case 'kicked':
         this.update({ status: 'kicked' })
@@ -213,9 +242,23 @@ export class PlayerClient {
         this.destroy()
         break
       case 'view': {
-        const v = msg.view
-        const deadline = v.phase === 'question' ? Date.now() + v.remainingMs : this.snapshot.deadline
-        this.update({ view: v, deadline, status: 'joined' })
+        let v = msg.view
+        if (!this.joined) {
+          // U relay může obrazovka dorazit dřív než potvrzení – bereme ji jako přihlášení.
+          this.joined = true
+          window.clearTimeout(this.joinTimer)
+          this.save()
+        }
+        if (v.phase === 'question' && v.qIndex === this.answeredQ && !v.answered) v = { ...v, answered: true }
+        const prev = this.snapshot.view
+        const sameQuestion = prev?.phase === 'question' && v.phase === 'question' && prev.qIndex === v.qIndex
+        const patch: Partial<ClientSnapshot> = { view: v, status: 'joined' }
+        if (v.phase === 'question') {
+          patch.deadline = Date.now() + (v.endsAt - hostNow)
+          if (!sameQuestion) patch.shownAt = Date.now()
+        }
+        this.link?.pace(PACE[v.phase])
+        this.update(patch)
         break
       }
     }

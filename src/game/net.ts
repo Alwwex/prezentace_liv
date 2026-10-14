@@ -33,8 +33,23 @@ export function randomId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
 
+/**
+ * Veřejná adresa hry, kterou mají otevřít mobily. Vercel při buildu doplní hlavní (produkční)
+ * doménu projektu. Hráči tak nedostanou dočasnou adresu nasazení, kterou Vercel chrání přihlášením.
+ */
+export function publicHost(): string {
+  const raw = typeof __PUBLIC_HOST__ === 'string' ? __PUBLIC_HOST__ : ''
+  if (raw) {
+    const host = raw.replace(/^https?:\/\//, '').replace(/\/.*$/, '')
+    if (host) return host
+  }
+  return location.host
+}
+
 export function joinUrl(pin: string): string {
-  return `${location.origin}/hrat?pin=${pin}`
+  const host = publicHost()
+  const proto = host === location.host ? location.protocol : 'https:'
+  return `${proto}//${host}/hrat?pin=${pin}`
 }
 
 export const AVATARS = ['🚂', '🎩', '🌹', '🕯️', '❄️', '📜', '🪶', '🫖', '🎻', '🦢', '🐎', '💌', '🌾', '⛪', '🎭', '🧣']

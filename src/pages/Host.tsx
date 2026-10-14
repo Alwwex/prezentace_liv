@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { QUESTION_SETS } from '../data/questions'
 import { HostGame, INTRO_MS, clearSavedGame, loadSavedGame, type HostSnapshot } from '../game/host'
-import { joinUrl } from '../game/net'
+import { joinUrl, publicHost } from '../game/net'
 import { TYPE_LABEL } from '../game/scoring'
 import { sound } from '../game/sound'
 import {
@@ -51,11 +51,17 @@ export function HostPage() {
                   setMode('resume')
                 }}
               >
-                Obnovit rozehranou hru (PIN {formatPin(saved.pin)}, {czPlayers(saved.players.length)})
+                Obnovit rozehranou hru (PIN {formatPin(saved.link?.pin ?? '')}, {czPlayers(saved.players.length)})
               </button>
             )}
           </div>
           <p className="hint">Tip: tlačítkem ⛶ přepneš na celou obrazovku. Hru posouváš mezerníkem, šipkou nebo klikátkem.</p>
+          {window.innerWidth < 700 && (
+            <p className="lobby-warn">
+              📱 Tahle stránka patří na počítač s projektorem a musí zůstat otevřená v popředí. Hráči se připojují na svých
+              mobilech přes úvodní stránku.
+            </p>
+          )}
           <a className="link" href="/">
             ← Zpět
           </a>
@@ -120,10 +126,22 @@ function HostRunner({ resume, onNewGame }: { resume: boolean; onNewGame: () => v
         </div>
         {s.phase !== 'lobby' && (
           <div className="pin-mini">
-            {location.host}/hrat · PIN <b>{formatPin(s.pin)}</b>
+            {publicHost()}/hrat · PIN <b>{formatPin(s.pin)}</b>
           </div>
         )}
         <div className="bar-right">
+          {s.link && (
+            <span
+              className={`link-chip link-${s.link}`}
+              title={
+                s.link === 'relay'
+                  ? 'Telefony se připojují přes server webu (funguje na každé síti).'
+                  : 'Telefony se připojují napřímo přes WebRTC (na některých sítích nefunguje).'
+              }
+            >
+              {s.link === 'relay' ? 'spojení přes server' : 'přímé spojení'}
+            </span>
+          )}
           <span className={`net net-${s.status}`} title={s.status === 'ready' ? 'Připojeno' : 'Připojuji…'} />
           <MuteButton />
           <FullscreenButton />
@@ -174,18 +192,27 @@ function Lobby({ s, game }: { s: HostSnapshot; game: HostGame }) {
       <div className="join-card">
         <div className="join-text">
           <p className="join-step">
-            Na mobilu otevři <b className="join-url">{location.host}</b>
+            Na mobilu otevři <b className="join-url">{publicHost()}</b>
           </p>
           <p className="join-step">a zadej PIN hry:</p>
-          <div className="pin-big" aria-label={`PIN ${s.pin}`}>
-            {formatPin(s.pin)}
+          <div className="pin-big" aria-label={s.pin ? `PIN ${s.pin}` : 'Připravuji PIN'}>
+            {s.pin ? formatPin(s.pin) : '··· ···'}
           </div>
         </div>
         <div className="join-qr">
-          <QR text={joinUrl(s.pin)} size={190} />
+          {s.pin ? <QR text={joinUrl(s.pin)} size={190} /> : <div className="qr qr-wait" style={{ width: 190, height: 190 }} />}
           <span>nebo naskenuj</span>
         </div>
       </div>
+      {s.link === 'p2p' && (
+        <p className="lobby-warn" role="note">
+          ⚠️ Web nemá připojenou databázi, takže se telefony spojují s tímto počítačem napřímo. Na školní Wi-Fi nebo mobilních
+          datech to často nefunguje. Spolehlivé spojení zapneš podle návodu v README (Vercel → Storage → Upstash Redis).{' '}
+          <a className="link" href="/test" target="_blank" rel="noreferrer">
+            Test připojení
+          </a>
+        </p>
+      )}
 
       <div className="lobby-main">
         <div className="lobby-head">
@@ -356,7 +383,9 @@ function FinalPhase({ s, game, onNewGame }: { s: HostSnapshot; game: HostGame; o
 
   const download = () => {
     const rows = [['Pořadí', 'Jméno', 'Body'], ...sorted.map((p) => [String(p.rank), p.name, String(p.score)])]
-    const csv = '﻿' + rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(';')).join('\r\n')
+    // Jména začínající =, +, - nebo @ by Excel spustil jako vzorec – předsadíme apostrof.
+    const cell = (c: string) => `"${(/^[=+\-@\t\r]/.test(c) ? "'" + c : c).replace(/"/g, '""')}"`
+    const csv = '\uFEFF' + rows.map((r) => r.map(cell).join(';')).join('\r\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const a = document.createElement('a')
     a.href = url

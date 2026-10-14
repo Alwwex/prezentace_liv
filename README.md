@@ -12,23 +12,40 @@ Hostitel pustí hru na projektoru, spolužáci se připojí z mobilů přes PIN 
 - **Reakce**: hráči posílají emoji, které letí přes plátno.
 - **Zajímavost „Věděli jste?“** po každé otázce, stupně vítězů s konfetami, statistika nejtěžší otázky a export výsledků do CSV.
 - **Trénink pro jednoho** (`/trenink`) funguje i bez dalších zařízení.
-- Zvuky a hudba se generují přímo v prohlížeči, hra se ovládá i mezerníkem, šipkou nebo prezentačním klikátkem.
+- **Test připojení** (`/test`) ukáže, jestli se na dané síti dá hrát.
 
 ## Jak hrát
 
-1. Na počítači s projektorem otevři web a klikni na **Spustit hru na projektoru** (adresa `/host`).
-2. Spolužáci na mobilu otevřou stejnou adresu a zadají PIN, nebo naskenují QR kód.
+1. Na počítači s projektorem otevři **hlavní adresu webu** s `/host` na konci (např. `https://prezentace-liv.vercel.app/host`) a klikni na **Otevřít nástupiště**.
+2. Spolužáci na mobilu otevřou stejnou adresu (bez `/host`) a zadají PIN, nebo naskenují QR kód.
 3. Vyber délku hry (celá jízda 12 otázek, nebo rychlík 3 otázky) a klikni **Vyjíždíme!**
 
 Když se stránka hostitele omylem obnoví, nabídne **Obnovit rozehranou hru** a hráči se připojí sami.
 
 ## Nasazení na Vercel
 
-1. Přihlas se na [vercel.com](https://vercel.com) přes GitHub.
-2. **Add New → Project** a vyber tento repozitář.
-3. Nic neměň (Vercel sám pozná Vite) a klikni **Deploy**.
+1. Přihlas se na [vercel.com](https://vercel.com) přes GitHub, dej **Add New → Project**, vyber tento repozitář a klikni **Deploy**.
+2. **Zapni spolehlivé spojení (databáze, zdarma, asi 2 minuty):**
+   1. Ve Vercelu otevři projekt a nahoře klikni na záložku **Storage**.
+   2. **Create Database** → vyber **Upstash for Redis** (případně „Redis“ od Upstash v Marketplace) → **Continue**.
+   3. Region zvol **Frankfurt (eu-central-1)**, plán **Free**, pojmenuj ji třeba `kviz` → **Create**.
+   4. V dalším kroku ji **připoj k projektu** (Connect Project) a nech zaškrtnutá všechna prostředí.
+   5. Otevři záložku **Deployments**, u posledního nasazení dej **⋯ → Redeploy**. Proměnné databáze se načtou jen při novém nasazení.
+3. Hotovo. Na `/test` by teď u „Server hry“ mělo být ✅ a v lobby hostitele štítek **spojení přes server**.
 
-Za chvíli dostaneš adresu typu `nazev.vercel.app`. Tu pak napíšeš spolužákům, případně ji ukáže lobby sama.
+**Proč databáze?** Bez ní se telefony spojují s počítačem napřímo (WebRTC). To na školní Wi-Fi a mobilních datech
+často nefunguje a telefon pak zůstane viset na „Připojuji se ke hře…“. S databází jde všechno přes server webu
+jako obyčejné HTTPS, takže hra funguje všude, kde jde otevřít web. Bezplatný tarif Upstash na hry ve třídě bohatě stačí.
+
+**Vercel hlásí přihlášení?** Používej hlavní adresu (`nazev-projektu.vercel.app`), ne dlouhou adresu konkrétního nasazení
+(`nazev-abc123-tvuj-ucet.vercel.app`). Ty chrání Vercel přihlášením, takže by se na ně spolužáci nedostali. QR kód v lobby
+proto vždy ukazuje na hlavní adresu. Případně vypni ochranu v **Settings → Deployment Protection → Vercel Authentication**.
+
+## Když se mobil nepřipojí
+
+1. Na mobilu otevři `/test` (odkaz je i na úvodní stránce). Ukáže, co funguje a co ne, a výsledek jde zkopírovat.
+2. Zkontroluj, že hostitel má otevřenou stránku `/host` na počítači a nechal ji v popředí.
+3. Bez databáze zkus dát mobil i počítač na stejnou Wi-Fi, nebo přepnout mezi Wi-Fi a mobilními daty. Spolehlivé řešení je databáze (viz výše).
 
 ## Úprava otázek
 
@@ -37,10 +54,10 @@ Jakmile je sad víc, v lobby se objeví výběr sady. Popis všech typů otázek
 
 ## Jak to funguje
 
-Web nemá vlastní server. Mobily se s počítačem hostitele spojí napřímo přes WebRTC (knihovna [PeerJS](https://peerjs.com)).
-K „seznámení“ zařízení se používá bezplatný server PeerJS Cloud.
-Pokud by školní síť WebRTC blokovala, dá se nastavit vlastní PeerJS server přes proměnné prostředí
-`VITE_PEER_HOST`, `VITE_PEER_PORT`, `VITE_PEER_PATH` a `VITE_PEER_SECURE`.
+- Hru řídí stránka hostitele, ta počítá body i pořadí.
+- **Se serverem (doporučeno):** telefony i hostitel si vyměňují zprávy přes Vercel Function [`api/relay.ts`](api/relay.ts). Ta je ukládá do Upstash Redis. Telefony se zhruba každou sekundu zeptají, co mají zobrazit.
+- **Bez databáze:** přímé spojení přes WebRTC ([PeerJS](https://peerjs.com), bezplatný server PeerJS Cloud). Vlastní PeerJS server se dá nastavit proměnnými `VITE_PEER_HOST`, `VITE_PEER_PORT`, `VITE_PEER_PATH` a `VITE_PEER_SECURE`.
+- Podle odpovědi `GET /api/relay` web sám pozná, kterou cestu použít.
 
 ## Spuštění na vlastním počítači
 
@@ -48,3 +65,5 @@ Pokud by školní síť WebRTC blokovala, dá se nastavit vlastní PeerJS server
 npm install
 npm run dev
 ```
+
+Při `npm run dev` běží `/api/relay` přímo ve Vite a data drží v paměti. Databázi pro vývoj nepotřebuješ.

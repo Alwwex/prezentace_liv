@@ -1,6 +1,7 @@
-import Peer, { type DataConnection } from 'peerjs'
 import { QUESTION_SETS } from '../data/questions'
-import { AVATARS, cleanName, hostPeerId, peerOptions, randomPin } from './net'
+import { P2PHostLink, RelayHostLink, relayAvailable, type HostLink, type LinkKind, type SavedLink } from './link'
+import { AVATARS, REACTIONS, cleanName, randomPin } from './net'
+import { later } from './ticker'
 import {
   correctText,
   evaluate,
@@ -53,6 +54,8 @@ export interface QuestionStat {
 export interface HostSnapshot {
   status: 'connecting' | 'ready' | 'error'
   error?: string
+  /** Jakým způsobem se připojují hráči (null = ještě se zjišťuje). */
+  link: LinkKind | null
   pin: string
   phase: HostPhase
   set: QuestionSet
@@ -61,6 +64,7 @@ export interface HostSnapshot {
   qIndex: number
   question: Question | undefined
   introEndsAt: number
+  /** Začátek otázky v místním čase prohlížeče (pro odpočet na plátně). */
   startedAt: number
   orderShuffle: number[]
   players: HostPlayer[]
@@ -71,8 +75,8 @@ export interface HostSnapshot {
 }
 
 interface SavedGame {
-  v: 1
-  pin: string
+  v: 2
+  link: SavedLink | null
   phase: HostPhase
   setId: string
   quick: boolean
@@ -86,14 +90,14 @@ interface SavedGame {
 const SAVE_KEY = 'expres-ak-host'
 export const INTRO_MS = 4500
 const MAX_PLAYERS = 80
-const PING_TIMEOUT = 16000
+const PING_TIMEOUT = 20000
 
 export function loadSavedGame(): SavedGame | null {
   try {
     const raw = localStorage.getItem(SAVE_KEY)
     if (!raw) return null
     const s = JSON.parse(raw) as SavedGame
-    if (s.v !== 1 || Date.now() - s.savedAt > 3 * 3600_000) return null
+    if (s.v !== 2 || !s.link?.pin || Date.now() - s.savedAt > 3 * 3600_000) return null
     if (s.phase === 'final' || (s.phase === 'lobby' && s.players.length === 0)) return null
     return s
   } catch {
@@ -115,41 +119,39 @@ function questionsOf(set: QuestionSet, quick: boolean): Question[] {
 }
 
 export class HostGame {
-  private peer: Peer | null = null
+  private link: HostLink | null = null
   private destroyed = false
   private listeners = new Set<() => void>()
   private snapshot!: HostSnapshot
   private players: HostPlayer[] = []
-  private conns = new Map<string, DataConnection>()
   private lastSeen = new Map<string, number>()
   private lastReact = new Map<string, number>()
   private banned = new Set<string>()
-  private timers: number[] = []
+  private timers: (() => void)[] = []
   private watchdog: number
   private reactionKey = 0
-  private restored: boolean
-  private reopening = false
 
   private status: HostSnapshot['status'] = 'connecting'
   private error: string | undefined
-  private pin: string
+  private pin = ''
   private phase: HostPhase = 'lobby'
   private set: QuestionSet = QUESTION_SETS[0]
   private quick = false
   private questions: Question[] = this.set.questions
   private qIndex = 0
   private introEndsAt = 0
+  /** Začátek otázky v časové ose spojení (u relay čas serveru). */
+  private startedAtLink = 0
+  /** Začátek otázky v místním čase. */
   private startedAt = 0
   private orderShuffle: number[] = []
   private reactions: Reaction[] = []
   private stats: QuestionStat[] = []
 
   constructor(saved?: SavedGame | null) {
-    this.restored = !!saved
-    this.pin = saved?.pin ?? randomPin()
     if (saved) this.restore(saved)
     this.buildSnapshot()
-    this.openPeer()
+    void this.connect(saved?.link ?? null)
     this.watchdog = window.setInterval(() => this.tick(), 3000)
   }
 
@@ -166,7 +168,7 @@ export class HostGame {
     this.destroyed = true
     this.clearTimers()
     window.clearInterval(this.watchdog)
-    this.peer?.destroy()
+    this.link?.destroy()
   }
 
   setOptions(setId: string, quick: boolean) {
@@ -213,16 +215,59 @@ export class HostGame {
   }
 
   kick(id: string) {
-    const conn = this.conns.get(id)
-    if (conn) {
-      this.send(conn, { t: 'kicked' })
-      window.setTimeout(() => conn.close(), 300)
-    }
-    this.conns.delete(id)
+    this.link?.send(id, { t: 'kicked' })
+    this.link?.drop(id)
     this.banned.add(id)
     this.players = this.players.filter((p) => p.id !== id)
     this.rank()
     this.broadcast()
+  }
+
+  // ---------- spojení ----------
+
+  private async connect(saved: SavedLink | null) {
+    const events = {
+      status: (status: HostSnapshot['status'], error?: string) => {
+        const wasReady = this.status === 'ready'
+        this.status = status
+        this.error = status === 'ready' ? undefined : error
+        // Po (znovu)připojení pošleme hráčům aktuální obrazovky.
+        if (status === 'ready' && !wasReady) this.broadcast()
+        else this.emit()
+      },
+      pin: (pin: string) => {
+        this.pin = pin
+        this.emit()
+      },
+      message: (id: string, msg: ClientMsg, at: number) => this.onMessage(id, msg, at),
+      drop: (id: string) => {
+        const p = this.players.find((x) => x.id === id)
+        if (p?.connected) {
+          p.connected = false
+          this.emit()
+        }
+      },
+    }
+    // Pokud má web databázi, jde spojení přes server (spolehlivé na každé síti),
+    // jinak přímo mezi zařízeními přes WebRTC.
+    const relay = await relayAvailable()
+    if (this.destroyed) return
+    if (relay) {
+      this.link = new RelayHostLink(events, saved?.kind === 'relay' ? saved : undefined)
+    } else {
+      const pin = saved?.kind === 'p2p' ? saved.pin : randomPin()
+      const restored = !!saved
+      this.link = new P2PHostLink(events, pin, () => !restored && this.phase === 'lobby' && this.players.length === 0)
+    }
+    this.emit()
+  }
+
+  private linkNow() {
+    return this.link ? this.link.now() : Date.now()
+  }
+
+  private send(id: string, msg: HostMsg) {
+    this.link?.send(id, msg)
   }
 
   // ---------- průběh hry ----------
@@ -260,6 +305,7 @@ export class HostGame {
     this.clearTimers()
     const q = this.questions[this.qIndex]
     this.startedAt = Date.now()
+    this.startedAtLink = this.linkNow()
     this.setPhase('question')
     this.later(() => this.endQuestion(), q.time * 1000 + 300)
   }
@@ -317,122 +363,59 @@ export class HostGame {
     this.broadcast()
   }
 
-  // ---------- síť ----------
+  // ---------- zprávy od hráčů ----------
 
-  private openPeer() {
-    this.reopening = false
-    if (this.destroyed) return
-    this.status = 'connecting'
-    const peer = new Peer(hostPeerId(this.pin), peerOptions())
-    this.peer = peer
-    peer.on('open', () => {
-      this.status = 'ready'
-      this.error = undefined
-      this.emit()
-    })
-    peer.on('connection', (conn) => this.onConnection(conn))
-    peer.on('disconnected', () => {
-      if (this.destroyed || peer.destroyed) return
-      this.status = 'connecting'
-      this.emit()
-      window.setTimeout(() => !peer.destroyed && peer.disconnected && peer.reconnect(), 1500)
-    })
-    peer.on('error', (err) => {
-      if (this.destroyed) return
-      const type = (err as { type?: string }).type
-      if (type === 'unavailable-id') {
-        this.reopening = true
-        peer.destroy()
-        // V lobby bez hráčů prostě vylosujeme nový PIN, jinak čekáme, až server uvolní ten starý.
-        if (this.phase === 'lobby' && this.players.length === 0 && !this.restored) this.pin = randomPin()
-        window.setTimeout(() => this.openPeer(), this.restored ? 3000 : 200)
-        return
-      }
-      if (type === 'peer-unavailable') return
-      if (type === 'browser-incompatible') {
-        this.status = 'error'
-        this.error = 'Tento prohlížeč nepodporuje WebRTC. Zkus Chrome, Edge, Firefox nebo Safari.'
-        this.emit()
-        return
-      }
-      this.status = 'error'
-      this.error = 'Nepodařilo se spojit se serverem. Zkouším to znovu…'
-      this.emit()
-    })
-  }
-
-  /** Hlídá spojení se serverem a hráče, kteří se odmlčeli. */
+  /** Hlídá hráče, kteří se dlouho neozvali (zavřený mobil, ztracený signál). */
   private tick() {
     if (this.destroyed) return
-    const peer = this.peer
-    if (!this.reopening) {
-      if (!peer || peer.destroyed) this.openPeer()
-      else if (peer.disconnected) peer.reconnect()
-    }
-
     const now = Date.now()
     let changed = false
     for (const p of this.players) {
       if (p.connected && now - (this.lastSeen.get(p.id) ?? 0) > PING_TIMEOUT) {
         p.connected = false
-        this.conns.get(p.id)?.close()
-        this.conns.delete(p.id)
+        this.link?.drop(p.id)
         changed = true
       }
     }
     if (changed) this.emit()
   }
 
-  private onConnection(conn: DataConnection) {
-    conn.on('data', (raw) => this.onData(conn, raw as ClientMsg))
-    const drop = () => {
-      for (const [id, c] of this.conns) {
-        if (c === conn) {
-          this.conns.delete(id)
-          const p = this.players.find((x) => x.id === id)
-          if (p) p.connected = false
-          this.emit()
-        }
-      }
-    }
-    conn.on('close', drop)
-    conn.on('error', drop)
-  }
-
-  private onData(conn: DataConnection, msg: ClientMsg) {
+  private onMessage(id: string, msg: ClientMsg, at: number) {
     if (!msg || typeof msg !== 'object') return
-    if (msg.t === 'hello') return this.onHello(conn, msg)
-    const id = this.idOf(conn)
-    if (!id) return
-    this.lastSeen.set(id, Date.now())
+    if (msg.t === 'hello') return this.onHello(id, msg)
     const p = this.players.find((x) => x.id === id)
-    if (!p) return
-    if (msg.t === 'ping') this.send(conn, { t: 'pong' })
-    else if (msg.t === 'answer') this.onAnswer(p, msg.qIndex, msg.answer, msg.joker)
+    if (!p) {
+      // Hráč, kterého hostitel nezná (např. po vyhození), dostane odmítnutí.
+      if (this.banned.has(id)) this.send(id, { t: 'rejected', reason: 'Hostitel tě z této hry odebral.' })
+      return
+    }
+    this.lastSeen.set(id, Date.now())
+    if (!p.connected) {
+      p.connected = true
+      this.sendView(p)
+      this.emit()
+    }
+    if (msg.t === 'ping') this.send(id, { t: 'pong' })
+    else if (msg.t === 'answer') this.onAnswer(p, msg, at)
     else if (msg.t === 'react') this.onReact(p, msg.emoji)
   }
 
-  private idOf(conn: DataConnection): string | undefined {
-    for (const [id, c] of this.conns) if (c === conn) return id
-    return undefined
-  }
-
-  private onHello(conn: DataConnection, msg: Extract<ClientMsg, { t: 'hello' }>) {
-    const id = String(msg.playerId || '').slice(0, 64)
+  private onHello(id: string, msg: Extract<ClientMsg, { t: 'hello' }>) {
+    id = String(id || '').slice(0, 64)
     if (!id) return
     if (this.banned.has(id)) {
-      this.send(conn, { t: 'rejected', reason: 'Hostitel tě z této hry odebral.' })
+      this.send(id, { t: 'rejected', reason: 'Hostitel tě z této hry odebral.' })
       return
     }
     let p = this.players.find((x) => x.id === id)
     if (!p) {
       if (this.players.length >= MAX_PLAYERS) {
-        this.send(conn, { t: 'rejected', reason: 'Hra je plná.' })
+        this.send(id, { t: 'rejected', reason: 'Hra je plná.' })
         return
       }
       let name = cleanName(String(msg.name || ''))
       if (!name) {
-        this.send(conn, { t: 'rejected', reason: 'Zadej přezdívku.' })
+        this.send(id, { t: 'rejected', reason: 'Zadej přezdívku.' })
         return
       }
       const taken = (n: string) => this.players.some((x) => x.name.toLowerCase() === n.toLowerCase())
@@ -458,23 +441,24 @@ export class HostGame {
       this.players.push(p)
       this.rank()
     }
-    const old = this.conns.get(id)
-    if (old && old !== conn) old.close()
-    this.conns.set(id, conn)
     this.lastSeen.set(id, Date.now())
     p.connected = true
-    this.send(conn, { t: 'welcome', playerId: id, name: p.name })
+    this.send(id, { t: 'welcome', playerId: id, name: p.name })
     this.broadcast()
   }
 
-  private onAnswer(p: HostPlayer, qIndex: number, value: Answer, joker: boolean) {
-    if (this.phase !== 'question' || qIndex !== this.qIndex || p.answer) return
+  private onAnswer(p: HostPlayer, msg: Extract<ClientMsg, { t: 'answer' }>, at: number) {
+    if (this.phase !== 'question' || msg.qIndex !== this.qIndex || p.answer) return
     const q = this.questions[this.qIndex]
-    const elapsed = Date.now() - this.startedAt
-    if (elapsed > q.time * 1000 + 1500) return
-    const useJoker = !!joker && !p.jokerUsed
+    const sinceStart = Math.max(0, at - this.startedAtLink)
+    if (sinceStart > q.time * 1000 + 2500) return
+    // Telefon posílá, za jak dlouho po zobrazení otázky hráč odpověděl. Díky tomu
+    // nikoho neznevýhodní pomalejší síť; víc, než kolik uplynulo na serveru, to být nemůže.
+    const reported = typeof msg.ms === 'number' && msg.ms >= 0 ? msg.ms : sinceStart
+    const elapsed = Math.min(sinceStart, reported)
+    const useJoker = !!msg.joker && !p.jokerUsed
     if (useJoker) p.jokerUsed = true
-    p.answer = { value, elapsed, joker: useJoker }
+    p.answer = { value: msg.answer, elapsed, joker: useJoker }
     this.sendView(p)
     this.emit()
     const waiting = this.players.some((x) => x.connected && !x.answer)
@@ -484,7 +468,7 @@ export class HostGame {
   private onReact(p: HostPlayer, emoji: string) {
     const now = Date.now()
     if (now - (this.lastReact.get(p.id) ?? 0) < 600) return
-    if (!['👏', '😮', '😂', '❤️', '🔥', '🚂'].includes(emoji)) return
+    if (!REACTIONS.includes(emoji)) return
     this.lastReact.set(p.id, now)
     const r = { key: ++this.reactionKey, emoji, x: 4 + Math.random() * 92 }
     this.reactions = [...this.reactions.slice(-30), r]
@@ -495,17 +479,8 @@ export class HostGame {
     }, 3200)
   }
 
-  private send(conn: DataConnection, msg: HostMsg) {
-    try {
-      if (conn.open) conn.send(msg)
-    } catch {
-      /* spojení se mezitím zavřelo */
-    }
-  }
-
   private sendView(p: HostPlayer) {
-    const conn = this.conns.get(p.id)
-    if (conn) this.send(conn, { t: 'view', view: this.viewFor(p) })
+    this.send(p.id, { t: 'view', view: this.viewFor(p), now: this.linkNow() })
   }
 
   private broadcast() {
@@ -536,7 +511,7 @@ export class HostGame {
           text: q.text,
           double: !!q.double,
           question: toPublic(q, this.orderShuffle),
-          remainingMs: Math.max(0, this.startedAt + q.time * 1000 - Date.now()),
+          endsAt: this.startedAtLink + q.time * 1000,
           totalMs: q.time * 1000,
           answered: !!p.answer,
         }
@@ -567,11 +542,11 @@ export class HostGame {
   // ---------- pomocné ----------
 
   private later(fn: () => void, ms: number) {
-    this.timers.push(window.setTimeout(fn, ms))
+    this.timers.push(later(fn, ms))
   }
 
   private clearTimers() {
-    this.timers.forEach((t) => window.clearTimeout(t))
+    this.timers.forEach((cancel) => cancel())
     this.timers = []
   }
 
@@ -586,6 +561,7 @@ export class HostGame {
     this.snapshot = {
       status: this.status,
       error: this.error,
+      link: this.link?.kind ?? null,
       pin: this.pin,
       phase: this.phase,
       set: this.set,
@@ -606,8 +582,8 @@ export class HostGame {
 
   private persist() {
     const save: SavedGame = {
-      v: 1,
-      pin: this.pin,
+      v: 2,
+      link: this.link && this.pin ? this.link.saved() : null,
       phase: this.phase,
       setId: this.set.id,
       quick: this.quick,
@@ -625,6 +601,7 @@ export class HostGame {
   }
 
   private restore(s: SavedGame) {
+    this.pin = s.link?.pin ?? ''
     this.set = QUESTION_SETS.find((x) => x.id === s.setId) ?? QUESTION_SETS[0]
     this.quick = s.quick
     this.questions = questionsOf(this.set, this.quick)

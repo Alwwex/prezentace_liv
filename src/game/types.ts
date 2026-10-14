@@ -125,7 +125,8 @@ export type PlayerView =
       text: string
       double: boolean
       question: PublicQuestion
-      remainingMs: number
+      /** Konec otázky v časové ose hostitele (viz HostMsg.view.now). */
+      endsAt: number
       totalMs: number
       answered: boolean
     }
@@ -144,13 +145,15 @@ export type PlayerView =
 
 export type ClientMsg =
   | { t: 'hello'; playerId: string; name: string; avatar: string }
-  | { t: 'answer'; qIndex: number; answer: Answer; joker: boolean }
+  /** ms = za jak dlouho po zobrazení otázky hráč odpověděl (měřeno na telefonu). */
+  | { t: 'answer'; qIndex: number; answer: Answer; joker: boolean; ms?: number }
   | { t: 'react'; emoji: string }
   | { t: 'ping' }
 
 export type HostMsg =
   | { t: 'welcome'; playerId: string; name: string }
   | { t: 'rejected'; reason: string }
-  | { t: 'view'; view: PlayerView }
+  /** now = aktuální čas v časové ose hostitele (u relay čas serveru). */
+  | { t: 'view'; view: PlayerView; now: number }
   | { t: 'kicked' }
   | { t: 'pong' }

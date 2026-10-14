@@ -10,6 +10,53 @@
   </head>
   <body>
     <div id="root"></div>
+    <noscript>Pro hru je potřeba zapnout JavaScript.</noscript>
+    <script>
+      // Když se aplikace nenačte (starý prohlížeč, výpadek sítě), ukážeme aspoň srozumitelnou zprávu.
+      ;(function () {
+        function show(title, text, detail) {
+          var root = document.getElementById('root')
+          if (!root) return
+          // Jakmile se aplikace vykreslí, zprávu nahradí – nic nepřepisujeme.
+          for (var i = 0; i < root.children.length; i++) {
+            if (!root.children[i].hasAttribute('data-fallback')) return
+          }
+          root.innerHTML = ''
+          var box = document.createElement('div')
+          box.setAttribute('data-fallback', '')
+          box.style.cssText =
+            'max-width:520px;margin:15vh auto;padding:24px;font:600 17px/1.5 system-ui,sans-serif;color:#fbf6f2;text-align:center'
+          var h = document.createElement('h1')
+          h.textContent = title
+          h.style.cssText = 'font-size:26px;margin:0 0 12px'
+          var p = document.createElement('p')
+          p.textContent = text
+          var small = document.createElement('p')
+          small.style.cssText = 'opacity:.6;font-size:12px;word-break:break-all;margin-top:16px'
+          small.textContent = detail + ' · ' + navigator.userAgent
+          box.appendChild(h)
+          box.appendChild(p)
+          box.appendChild(small)
+          root.appendChild(box)
+        }
+        window.addEventListener('error', function (e) {
+          setTimeout(function () {
+            show(
+              'Hru se nepodařilo spustit',
+              'Zkus stránku obnovit. Pokud to nepomůže, aktualizuj prohlížeč (iOS 14 / Chrome 87 nebo novější) nebo použij jiný.',
+              'Chyba: ' + (e && e.message ? e.message : 'neznámá'),
+            )
+          }, 0)
+        })
+        setTimeout(function () {
+          show(
+            'Hra se pořád načítá…',
+            'Připojení je asi pomalé. Chvíli počkej, případně stránku obnov.',
+            'Načítání trvá déle než 10 s',
+          )
+        }, 10000)
+      })()
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -10,11 +10,15 @@ import type { Answer, PlayerView } from '../game/types'
 export function PlayPage({ landing }: { landing?: boolean }) {
   const params = new URLSearchParams(location.search)
   const urlPin = (params.get('pin') ?? '').replace(/\D/g, '').slice(0, 6)
+  const [saved] = useState(loadSavedPlayer)
   const [client, setClient] = useState<PlayerClient | null>(() => {
-    const saved = loadSavedPlayer()
-    if (saved && (!urlPin || urlPin === saved.pin)) return new PlayerClient(saved.pin, saved.name, saved.avatar, saved.playerId)
+    // Po obnovení stránky (adresa obsahuje PIN rozehrané hry) pokračujeme automaticky.
+    if (saved && urlPin === saved.pin) {
+      return new PlayerClient(saved.pin, saved.name, saved.avatar, saved.playerId, saved.link, saved.joined)
+    }
     return null
   })
+  const [resume, setResume] = useState(() => (saved && !urlPin ? saved : null))
   const [formError, setFormError] = useState('')
   const [lastPin, setLastPin] = useState(urlPin)
   useEffect(() => () => client?.destroy(), [client])
@@ -25,6 +29,22 @@ export function PlayPage({ landing }: { landing?: boolean }) {
         initialPin={lastPin}
         landing={landing}
         error={formError}
+        resume={
+          resume
+            ? {
+                pin: resume.pin,
+                name: resume.name,
+                go: () => {
+                  setResume(null)
+                  setClient(new PlayerClient(resume.pin, resume.name, resume.avatar, resume.playerId, resume.link, resume.joined))
+                },
+                dismiss: () => {
+                  clearSavedPlayer()
+                  setResume(null)
+                },
+              }
+            : null
+        }
         onJoin={(pin, name, avatar) => {
           setFormError('')
           setLastPin(pin)
@@ -39,6 +59,14 @@ export function PlayPage({ landing }: { landing?: boolean }) {
       onLeave={(err) => {
         clearSavedPlayer()
         setFormError(err ?? '')
+        // Dobrovolný odchod = začínáme načisto; při chybě necháme PIN k opravě.
+        if (!err) setLastPin('')
+        // PIN neplatné hry z adresy odstraníme, ať ji obnovení stránky znovu nenačte.
+        try {
+          history.replaceState(null, '', '/hrat')
+        } catch {
+          /* nic */
+        }
         setClient(null)
       }}
     />
@@ -51,11 +79,13 @@ function JoinForm({
   initialPin,
   landing,
   error,
+  resume,
   onJoin,
 }: {
   initialPin: string
   landing?: boolean
   error: string
+  resume: { pin: string; name: string; go: () => void; dismiss: () => void } | null
   onJoin: (pin: string, name: string, avatar: string) => void
 }) {
   const [pin, setPin] = useState(initialPin)
@@ -72,6 +102,22 @@ function JoinForm({
         <h1 className="title">Expres Anna Karenina</h1>
         {landing && <p className="lead">Kvíz o Tolstém a jeho slavném románu</p>}
       </div>
+
+      {resume && (
+        <div className="resume-card">
+          <p>
+            Rozehraná hra <b>{resume.pin}</b> jako <b>{resume.name}</b>
+          </p>
+          <div className="pad-row">
+            <button className="btn btn-gold grow" onClick={resume.go}>
+              Pokračovat ve hře
+            </button>
+            <button className="btn btn-ghost" onClick={resume.dismiss}>
+              Zahodit
+            </button>
+          </div>
+        </div>
+      )}
 
       {step === 'pin' ? (
         <form
@@ -94,10 +140,27 @@ function JoinForm({
             onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
             autoFocus
           />
-          {error && <p className="form-error">{error}</p>}
+          {error && (
+            <p className="form-error">
+              {error}{' '}
+              <a className="link" href="/test">
+                Otestovat připojení
+              </a>
+            </p>
+          )}
           <button className="btn btn-gold btn-block btn-lg" disabled={pin.length !== 6}>
             Pokračovat
           </button>
+          {landing ? (
+            <ol className="how-to">
+              <li>
+                Na počítači s projektorem otevři <b>{location.host}/host</b> a klikni na „Otevřít nástupiště“.
+              </li>
+              <li>Na mobilu zadej PIN z plátna, nebo naskenuj QR kód.</li>
+            </ol>
+          ) : (
+            <p className="join-help">PIN uvidíš na plátně, až hru spustí hostitel na počítači.</p>
+          )}
         </form>
       ) : (
         <form
@@ -156,6 +219,9 @@ function JoinForm({
           <a className="btn btn-ghost" href="/trenink">
             🎯 Trénink pro jednoho
           </a>
+          <a className="link landing-test" href="/test">
+            Nejde se připojit? Otestuj připojení
+          </a>
         </nav>
       )}
     </div>
@@ -171,6 +237,20 @@ function Joined({ client, onLeave }: { client: PlayerClient; onLeave: (err?: str
     if (s.status === 'error') onLeave(s.error)
   }, [s.status, s.error, onLeave])
 
+  // Po připojení dáme PIN do adresy, aby obnovení stránky vrátilo hráče rovnou do hry.
+  const joined = s.status === 'joined'
+  useEffect(() => {
+    if (!joined) return
+    const want = `/hrat?pin=${client.gamePin}`
+    if (location.pathname + location.search !== want) {
+      try {
+        history.replaceState(null, '', want)
+      } catch {
+        /* nic */
+      }
+    }
+  }, [joined, client])
+
   if (s.status === 'kicked') {
     return (
       <div className="phone center">
@@ -184,19 +264,7 @@ function Joined({ client, onLeave }: { client: PlayerClient; onLeave: (err?: str
   }
 
   const v = s.view
-  if (!v || s.status === 'connecting') {
-    return (
-      <div className="phone center">
-        <div className="loader-train" aria-hidden="true">
-          🚂
-        </div>
-        <p>{s.error ?? 'Připojuji se ke hře…'}</p>
-        <button className="btn btn-ghost" onClick={() => onLeave()}>
-          Zrušit
-        </button>
-      </div>
-    )
-  }
+  if (!v || s.status === 'connecting') return <Connecting onCancel={() => onLeave()} />
 
   return (
     <div className={`phone ingame phase-${v.phase}`}>
@@ -212,10 +280,47 @@ function Joined({ client, onLeave }: { client: PlayerClient; onLeave: (err?: str
         )}
         <span className="ph-score">{v.me.score.toLocaleString('cs-CZ')}</span>
       </header>
-      {s.status === 'reconnecting' && <div className="banner">Spojení se přerušilo, připojuji znovu…</div>}
+      {s.status === 'reconnecting' && (
+        <div className="banner" role="status">
+          Spojení se přerušilo, připojuji znovu…
+        </div>
+      )}
+      {s.status === 'host-away' && (
+        <div className="banner banner-error" role="status">
+          Počítač se hrou neodpovídá. Je hra na projektoru pořád otevřená?{' '}
+          <button className="link" onClick={() => onLeave()}>
+            Odejít
+          </button>
+        </div>
+      )}
       <main className="ph-main">
         <PhaseView view={v} deadline={s.deadline} client={client} onLeave={onLeave} />
       </main>
+    </div>
+  )
+}
+
+function Connecting({ onCancel }: { onCancel: () => void }) {
+  const [start] = useState(() => Date.now())
+  const now = useNow(1000)
+  const slow = now - start > 8000
+  return (
+    <div className="phone center">
+      <div className="loader-train" aria-hidden="true">
+        🚂
+      </div>
+      <p>Připojuji se ke hře…</p>
+      {slow && (
+        <p className="join-help">
+          Trvá to dlouho? Zkontroluj PIN a že je hra na počítači spuštěná.{' '}
+          <a className="link" href="/test">
+            Otestovat připojení
+          </a>
+        </p>
+      )}
+      <button className="btn btn-ghost" onClick={onCancel}>
+        Zrušit
+      </button>
     </div>
   )
 }
@@ -383,7 +488,7 @@ function FinalView({ view: v, onLeave }: { view: Extract<PlayerView, { phase: 'f
       </h2>
       <p className="res-points">{czPoints(v.me.score)}</p>
       <p>Konečná stanice. Díky za jízdu!</p>
-      <button className="btn btn-ghost" onClick={onLeave}>
+      <button className="btn btn-ghost" onClick={() => onLeave()}>
         Odejít ze hry
       </button>
     </div>
