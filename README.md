@@ -28,11 +28,12 @@ Tlačítkem **Zamknout vstup** v lobby zabráníš tomu, aby se do hry připojov
 1. Přihlas se na [vercel.com](https://vercel.com) přes GitHub, dej **Add New → Project**, vyber tento repozitář a klikni **Deploy**.
 2. **Zapni spolehlivé spojení (databáze, zdarma, asi 2 minuty):**
    1. Ve Vercelu otevři projekt a nahoře klikni na záložku **Storage**.
-   2. **Create Database** → vyber **Upstash for Redis** (případně „Redis“ od Upstash v Marketplace) → **Continue**.
+   2. **Create Database** → vyber **Upstash for Redis** (doporučeno) → **Continue**. Funguje i „Redis“ (Redis Cloud), web si poradí s oběma.
    3. Region zvol **Frankfurt (eu-central-1)**, plán **Free**, pojmenuj ji třeba `kviz` → **Create**.
    4. V dalším kroku ji **připoj k projektu** (Connect Project) a nech zaškrtnutá všechna prostředí.
    5. Otevři záložku **Deployments**, u posledního nasazení dej **⋯ → Redeploy**. Proměnné databáze se načtou jen při novém nasazení.
-3. Hotovo. Na `/test` by teď u „Server hry“ mělo být ✅ a v lobby hostitele štítek **spojení přes server**.
+3. Hotovo. Na `/test` by teď u „Server hry“ mělo být ✅ i s názvem databáze a v lobby hostitele štítek **spojení přes server**.
+   Když tam pořád stojí „Server zatím nevidí žádnou databázi“, databáze není připojená k tomuto projektu, nebo chybí krok 5 (Redeploy).
 
 **Proč databáze?** Bez ní se telefony spojují s počítačem napřímo (WebRTC). To na školní Wi-Fi a mobilních datech
 často nefunguje a telefon pak zůstane viset na „Připojuji se ke hře…“. S databází jde všechno přes server webu
@@ -60,7 +61,7 @@ Jakmile je sad víc, v lobby se objeví výběr sady. Popis všech typů otázek
 ## Jak to funguje
 
 - Hru řídí stránka hostitele, ta počítá body i pořadí.
-- **Se serverem (doporučeno):** telefony i hostitel si vyměňují zprávy přes Vercel Function [`api/relay.ts`](api/relay.ts). Ta je ukládá do Upstash Redis. Telefony se zhruba každou sekundu zeptají, co mají zobrazit.
+- **Se serverem (doporučeno):** telefony i hostitel si vyměňují zprávy přes Vercel Function [`api/relay.ts`](api/relay.ts). Ta je ukládá do Redisu: Upstash přes REST (`KV_REST_API_URL`/`KV_REST_API_TOKEN` nebo `UPSTASH_REDIS_REST_URL`/`…_TOKEN`), nebo jakýkoli Redis přes `REDIS_URL`. Telefony se zhruba každou sekundu zeptají, co mají zobrazit.
 - **Bez databáze:** přímé spojení přes WebRTC ([PeerJS](https://peerjs.com), bezplatný server PeerJS Cloud). Vlastní PeerJS server se dá nastavit proměnnými `VITE_PEER_HOST`, `VITE_PEER_PORT`, `VITE_PEER_PATH` a `VITE_PEER_SECURE`.
 - Podle odpovědi `GET /api/relay` web sám pozná, kterou cestu použít.
 

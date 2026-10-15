@@ -13,6 +13,12 @@ interface Check {
 
 const ICON: Record<State, string> = { wait: '⏳', ok: '✅', warn: '⚠️', bad: '❌' }
 
+const STORE_NAME: Record<string, string> = {
+  upstash: 'Upstash Redis',
+  redis: 'Redis',
+  memory: 'paměť – jen lokální vývoj',
+}
+
 async function timed<T>(fn: () => Promise<T>): Promise<[T, number]> {
   const t0 = performance.now()
   const r = await fn()
@@ -52,13 +58,28 @@ export function DiagPage() {
         const [health, ms] = await timed(async () => {
           const r = await fetch('/api/relay', { cache: 'no-store' })
           if (!r.ok) throw new Error(`HTTP ${r.status}`)
-          return (await r.json()) as { relay?: boolean; reason?: string }
+          return (await r.json()) as { relay?: boolean; reason?: string; store?: string; env?: string[] }
         })
+        const env = health.env ?? []
         if (!health.relay) {
           if (health.reason === 'store-error') {
-            upd('relay', 'bad', 'Databáze je připojená, ale neodpovídá (vyčerpaný měsíční limit, nebo smazaná databáze). Hra zatím použije přímé spojení.')
+            upd(
+              'relay',
+              'bad',
+              `Databáze (${STORE_NAME[health.store ?? ''] ?? 'neznámá'}) je připojená, ale neodpovídá – vyčerpaný měsíční limit, nebo smazaná databáze. Hra zatím použije přímé spojení.`,
+            )
+          } else if (env.length) {
+            upd(
+              'relay',
+              'warn',
+              `Server vidí proměnné ${env.join(', ')}, ale žádná neobsahuje adresu databáze, se kterou umím pracovat. Použij Upstash for Redis (viz README).`,
+            )
           } else {
-            upd('relay', 'warn', 'Server běží, ale nemá připojenou databázi. Hra použije přímé spojení. Návod na zapnutí je v README.')
+            upd(
+              'relay',
+              'warn',
+              'Server zatím nevidí žádnou databázi. Ve Vercelu ji připoj k projektu (Storage → Upstash for Redis → Connect Project) a potom dej u posledního nasazení Redeploy. Do té doby hra použije přímé spojení.',
+            )
           }
           return
         }
@@ -67,7 +88,7 @@ export function DiagPage() {
           post({ op: 'send', pin: room.pin, playerId: 'diag', msg: { t: 'ping' } }),
         )
         await post({ op: 'sync', pin: room.pin, secret: room.secret, slots: {} })
-        upd('relay', 'ok', `Funguje. Odezva ${ms} / ${ms2} / ${ms3} ms.`)
+        upd('relay', 'ok', `Funguje (${STORE_NAME[health.store ?? ''] ?? 'databáze'}). Odezva ${ms} / ${ms2} / ${ms3} ms.`)
       } catch (e) {
         upd('relay', 'bad', `Server neodpovídá (${(e as Error).message}).`)
       }

@@ -151,15 +151,96 @@ function findUpstash(env: Record<string, string | undefined>): { url: string; to
   return null
 }
 
+/**
+ * Adresa „obyčejného“ Redisu (např. Redis Cloud z Vercel Marketplace dává jen REDIS_URL).
+ * Upstash nastavuje i REST proměnné, které mají přednost.
+ */
+function findRedisUrl(env: Record<string, string | undefined>): string | null {
+  const keys = Object.keys(env)
+    .filter((key) => /(^|_)(REDIS_URL|KV_URL)$/.test(key))
+    .sort((a, b) => a.length - b.length)
+  for (const key of keys) {
+    const url = env[key]
+    if (url && /^rediss?:\/\//.test(url)) return url
+  }
+  return null
+}
+
+interface RedisLike {
+  sendCommand(args: string[]): Promise<unknown>
+}
+
+// Spojení s Redisem si instance funkce drží mezi požadavky.
+let tcp: Promise<RedisLike> | null = null
+
+function connectRedis(url: string): Promise<RedisLike> {
+  const connecting = (async () => {
+    const { createClient } = await import('redis')
+    const client = createClient({
+      url,
+      // Při výpadku spojení příkazy hned selžou místo čekání ve frontě.
+      disableOfflineQueue: true,
+      socket: {
+        connectTimeout: 4000,
+        // Pár rychlých pokusů, pak chyba – ať dotaz nevisí, když je databáze nedostupná.
+        reconnectStrategy: (retries: number) => (retries >= 2 ? new Error('Redis je nedostupný') : 300 * (retries + 1)),
+      },
+    })
+    client.on('error', (e: Error) => console.error('redis error', e.message))
+    client.on('end', () => {
+      if (tcp === connecting) tcp = null
+    })
+    await client.connect()
+    return client as unknown as RedisLike
+  })()
+  connecting.catch(() => {
+    if (tcp === connecting) tcp = null
+  })
+  return connecting
+}
+
+function tcpStore(url: string): Store {
+  return {
+    async run(cmds) {
+      tcp ??= connectRedis(url)
+      const current = tcp
+      try {
+        const client = await current
+        return await Promise.all(cmds.map((c) => client.sendCommand(c.map(String))))
+      } catch (e) {
+        // Chyba spojení (ne chybná odpověď Redisu) – příští požadavek se připojí znovu.
+        const kind = (e as object | null)?.constructor?.name ?? ''
+        if (!['SimpleError', 'BlobError', 'ErrorReply'].includes(kind) && tcp === current) tcp = null
+        throw e
+      }
+    },
+  }
+}
+
+type StoreKind = 'upstash' | 'redis' | 'memory'
+
 function getStore(): Store | null {
+  return pickStore()?.store ?? null
+}
+
+function pickStore(): { store: Store; kind: StoreKind } | null {
   const env = process.env
   // Jen pro testy: vypne relay a hra použije přímé spojení.
   if (env.RELAY_DISABLED) return null
   const creds = findUpstash(env)
-  if (creds) return upstashStore(creds.url, creds.token)
+  if (creds) return { store: upstashStore(creds.url, creds.token), kind: 'upstash' }
+  const redisUrl = findRedisUrl(env)
+  if (redisUrl) return { store: tcpStore(redisUrl), kind: 'redis' }
   // Na Vercelu bez databáze relay nenabízíme (paměť se mezi instancemi nesdílí).
   if (env.VERCEL) return null
-  return memoryStore()
+  return { store: memoryStore(), kind: 'memory' }
+}
+
+/** Názvy (ne hodnoty!) proměnných, které vypadají jako databáze – pro stránku /test. */
+function dbEnvNames(): string[] {
+  return Object.keys(process.env)
+    .filter((key) => /REDIS|UPSTASH|(^|_)KV_/.test(key))
+    .sort()
 }
 
 // ---------- pomocné ----------
@@ -292,10 +373,10 @@ let health: { ok: boolean; at: number } | null = null
  * (např. po vyčerpání měsíčního limitu ne) – pak web použije přímé spojení.
  */
 export async function GET(): Promise<Response> {
-  const store = getStore()
-  if (!store) return json({ relay: false, reason: 'no-store', now: Date.now() })
+  const picked = pickStore()
+  if (!picked) return json({ relay: false, reason: 'no-store', env: dbEnvNames(), now: Date.now() })
   if (!health || Date.now() - health.at > 30_000) {
-    const ok = await store.run([['PING']]).then(
+    const ok = await picked.store.run([['PING']]).then(
       () => true,
       (e) => {
         console.error('relay store unavailable', e)
@@ -304,7 +385,13 @@ export async function GET(): Promise<Response> {
     )
     health = { ok, at: Date.now() }
   }
-  return json({ relay: health.ok, reason: health.ok ? undefined : 'store-error', now: Date.now() })
+  return json({
+    relay: health.ok,
+    reason: health.ok ? undefined : 'store-error',
+    store: picked.kind,
+    env: dbEnvNames(),
+    now: Date.now(),
+  })
 }
 
 export async function POST(request: Request): Promise<Response> {
